@@ -4,6 +4,53 @@ import { stdin as input, stdout as output } from "node:process";
 import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { setupCcrEnvironment } from "./ccr.js";
 
+const DEBUG_MODE = process.argv.includes("--debug") || process.env.CLAUDE_DEBUG === "1";
+
+function debugLog(message: string): void {
+  if (!DEBUG_MODE) {
+    return;
+  }
+  output.write(`[debug] ${message}\n`);
+}
+
+function summarizeSdkMessage(message: SDKMessage): string {
+  if (message.type === "system") {
+    return `system:${message.subtype}`;
+  }
+  if (message.type === "result") {
+    return `result:${message.subtype}`;
+  }
+  if (message.type === "assistant") {
+    return "assistant";
+  }
+  return message.type;
+}
+
+async function checkRouterReachability(): Promise<void> {
+  const baseUrl = process.env.ANTHROPIC_BASE_URL;
+  if (!baseUrl) {
+    return;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 4000);
+
+  try {
+    const response = await fetch(baseUrl, {
+      method: "GET",
+      signal: controller.signal,
+    });
+    debugLog(`Router reachable: ${baseUrl} (HTTP ${response.status})`);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `無法連到 CCR Router: ${baseUrl}。請確認在同一台機器已啟動 \`ccr start\`。詳細: ${detail}`,
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function printAssistantMessage(message: SDKMessage): boolean {
   if (message.type !== "assistant") {
     return false;
@@ -46,6 +93,8 @@ async function askClaude(prompt: string): Promise<void> {
         abortController,
       },
     })) {
+      debugLog(`event=${summarizeSdkMessage(message)}`);
+
       if (message.type === "assistant") {
         printedAnyText = printAssistantMessage(message) || printedAnyText;
       }
@@ -93,10 +142,15 @@ async function askClaude(prompt: string): Promise<void> {
 
 async function main(): Promise<void> {
   setupCcrEnvironment();
+  await checkRouterReachability();
 
   const rl = createInterface({ input, output });
   output.write("Claude Agent SDK CLI (via CCR)\n");
-  output.write("輸入訊息後按 Enter，輸入 /exit 離開。\n\n");
+  output.write("輸入訊息後按 Enter，輸入 /exit 離開。\n");
+  if (DEBUG_MODE) {
+    output.write("[debug] mode enabled\n");
+  }
+  output.write("\n");
 
   try {
     while (true) {
