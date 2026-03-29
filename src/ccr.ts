@@ -10,6 +10,8 @@ const CCR_ENV_KEYS = [
   "API_TIMEOUT_MS",
 ] as const;
 
+const ANSI_ESCAPE_REGEX = /\x1B\[[0-?]*[ -/]*[@-~]/g;
+
 function unwrapQuotedValue(rawValue: string): string {
   const value = rawValue.trim();
   if (
@@ -21,43 +23,69 @@ function unwrapQuotedValue(rawValue: string): string {
   return value;
 }
 
-function extractEnvValue(activateOutput: string, key: string): string | undefined {
-  for (const rawLine of activateOutput.split("\n")) {
-    const line = rawLine.trim();
-    if (!line) {
-      continue;
-    }
+function normalizeKey(rawKey: string): string {
+  return rawKey.trim().replace(/[\s-]+/g, "_").toUpperCase();
+}
 
-    const exportPrefix = `export ${key}=`;
-    if (line.startsWith(exportPrefix)) {
-      return unwrapQuotedValue(line.slice(exportPrefix.length));
-    }
+function parseEnvLine(rawLine: string): { key: string; value: string } | null {
+  const line = rawLine.replace(ANSI_ESCAPE_REGEX, "").trim();
+  if (!line || line.startsWith("unset ")) {
+    return null;
+  }
 
-    const fishPrefix = `set -gx ${key} `;
-    if (line.startsWith(fishPrefix)) {
-      return unwrapQuotedValue(line.slice(fishPrefix.length));
-    }
+  const patterns = [
+    /^\$env:([A-Za-z_][A-Za-z0-9_\s-]*)\s*=\s*(.+)$/i, // PowerShell
+    /^set\s+([A-Za-z_][A-Za-z0-9_\s-]*)\s*=\s*(.+)$/i, // cmd
+    /^set\s+-gx\s+([A-Za-z_][A-Za-z0-9_\s-]*)\s+(.+)$/i, // fish
+    /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_\s-]*)\s*=\s*(.+)$/i, // sh/zsh
+  ];
 
-    const kvPrefix = `${key}=`;
-    if (line.startsWith(kvPrefix)) {
-      return unwrapQuotedValue(line.slice(kvPrefix.length));
-    }
-
-    const cmdSetPrefix = `set ${key}=`;
-    if (line.toLowerCase().startsWith(cmdSetPrefix.toLowerCase())) {
-      return unwrapQuotedValue(line.slice(cmdSetPrefix.length));
-    }
-
-    const psPrefix = `$env:${key}`;
-    if (line.toLowerCase().startsWith(psPrefix.toLowerCase())) {
-      const idx = line.indexOf("=");
-      if (idx >= 0) {
-        return unwrapQuotedValue(line.slice(idx + 1));
-      }
+  for (const pattern of patterns) {
+    const match = line.match(pattern);
+    if (match) {
+      return {
+        key: normalizeKey(match[1]),
+        value: unwrapQuotedValue(match[2]),
+      };
     }
   }
 
-  return undefined;
+  return null;
+}
+
+function hydrateEnvFromText(text: string): void {
+  const wanted = new Set(CCR_ENV_KEYS);
+  for (const rawLine of text.split(/\r?\n/)) {
+    const parsed = parseEnvLine(rawLine);
+    if (!parsed) {
+      continue;
+    }
+
+    if (wanted.has(parsed.key as (typeof CCR_ENV_KEYS)[number])) {
+      process.env[parsed.key] = parsed.value;
+    }
+  }
+}
+
+function fallbackHydrateEnvViaShell(): void {
+  try {
+    if (process.platform === "win32") {
+      const envDump = execSync(
+        'powershell -NoProfile -Command "Invoke-Expression (& ccr activate); Get-ChildItem Env: | ForEach-Object { \\"$($_.Name)=$($_.Value)\\" }"',
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      );
+      hydrateEnvFromText(envDump);
+      return;
+    }
+
+    const envDump = execSync('sh -lc \'eval "$(ccr activate)"; env\'', {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    hydrateEnvFromText(envDump);
+  } catch {
+    // Keep original behavior: final error will explain missing env.
+  }
 }
 
 export function setupCcrEnvironment(): void {
@@ -76,11 +104,10 @@ export function setupCcrEnvironment(): void {
     );
   }
 
-  for (const key of CCR_ENV_KEYS) {
-    const value = extractEnvValue(activateOutput, key);
-    if (value) {
-      process.env[key] = value;
-    }
+  hydrateEnvFromText(activateOutput);
+
+  if (!process.env.ANTHROPIC_BASE_URL) {
+    fallbackHydrateEnvViaShell();
   }
 
   if (!process.env.ANTHROPIC_BASE_URL) {
