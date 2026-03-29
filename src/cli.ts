@@ -5,6 +5,7 @@ import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { setupCcrEnvironment } from "./ccr.js";
 
 const DEBUG_MODE = process.argv.includes("--debug") || process.env.CLAUDE_DEBUG === "1";
+const STRICT_BASIC_MODE = process.env.CLAUDE_STRICT_BASIC_MODE !== "0";
 
 function debugLog(message: string): void {
   if (!DEBUG_MODE) {
@@ -67,11 +68,34 @@ function printAssistantMessage(message: SDKMessage): boolean {
   return printed;
 }
 
+function printStreamDelta(message: SDKMessage): boolean {
+  if (message.type !== "stream_event") {
+    return false;
+  }
+
+  const event = message.event as {
+    type?: string;
+    delta?: { type?: string; text?: string };
+  };
+
+  if (event?.type === "content_block_delta" && event?.delta?.type === "text_delta") {
+    const text = event.delta.text ?? "";
+    if (text) {
+      output.write(text);
+      return true;
+    }
+  }
+
+  return false;
+}
+
 async function askClaude(prompt: string): Promise<void> {
   const timeoutMs = Number(process.env.CLAUDE_QUERY_TIMEOUT_MS ?? "120000");
   const abortController = new AbortController();
   let printedAnyText = false;
   let printedSystemHint = false;
+  let seenFirstEvent = false;
+  let printedStreamingText = false;
 
   const waitingHintTimer = setTimeout(() => {
     printedSystemHint = true;
@@ -87,16 +111,26 @@ async function askClaude(prompt: string): Promise<void> {
       prompt,
       options: {
         cwd: process.cwd(),
-        permissionMode: "bypassPermissions",
-        allowDangerouslySkipPermissions: true,
-        maxTurns: 8,
+        // Strict mode: keep request shape close to plain chat (system + user).
+        permissionMode: STRICT_BASIC_MODE ? "plan" : "bypassPermissions",
+        allowDangerouslySkipPermissions: STRICT_BASIC_MODE ? undefined : true,
+        allowedTools: STRICT_BASIC_MODE ? [] : undefined,
+        includePartialMessages: !STRICT_BASIC_MODE,
+        maxTurns: STRICT_BASIC_MODE ? 1 : 8,
+        systemPrompt: "You are a helpful assistant. Reply in plain text only.",
         abortController,
       },
     })) {
+      seenFirstEvent = true;
       debugLog(`event=${summarizeSdkMessage(message)}`);
 
+      printedStreamingText = printStreamDelta(message) || printedStreamingText;
+
       if (message.type === "assistant") {
-        printedAnyText = printAssistantMessage(message) || printedAnyText;
+        // If stream deltas were already printed, skip final assistant block to avoid duplicate text.
+        if (!printedStreamingText) {
+          printedAnyText = printAssistantMessage(message) || printedAnyText;
+        }
       }
 
       if (message.type === "auth_status" && message.output.length > 0) {
@@ -114,10 +148,13 @@ async function askClaude(prompt: string): Promise<void> {
       if (message.type === "result") {
         if (message.subtype === "success") {
           if (message.result.trim()) {
-            if (printedAnyText || printedSystemHint) {
+            if (printedAnyText || printedSystemHint || printedStreamingText) {
               output.write("\n");
             }
-            output.write(message.result);
+            // If stream deltas were already printed, result is usually duplicate summary text.
+            if (!printedStreamingText) {
+              output.write(message.result);
+            }
           }
         } else {
           const details = message.errors.join(" | ") || "Unknown execution error";
@@ -127,6 +164,11 @@ async function askClaude(prompt: string): Promise<void> {
     }
   } catch (error) {
     if (abortController.signal.aborted) {
+      if (!seenFirstEvent) {
+        throw new Error(
+          `等待逾時（>${Math.floor(timeoutMs / 1000)} 秒）：Claude Agent SDK 連第一個事件都沒收到（init 卡住）。通常是該機器上的 ccr 上游模型未配置或無法連出外網。`,
+        );
+      }
       throw new Error(
         `等待逾時（>${Math.floor(timeoutMs / 1000)} 秒）。你可以檢查 ccr 狀態，或調高 CLAUDE_QUERY_TIMEOUT_MS。`,
       );
@@ -147,6 +189,11 @@ async function main(): Promise<void> {
   const rl = createInterface({ input, output });
   output.write("Claude Agent SDK CLI (via CCR)\n");
   output.write("輸入訊息後按 Enter，輸入 /exit 離開。\n");
+  output.write(
+    STRICT_BASIC_MODE
+      ? "[mode] strict basic messages (no tools, plan mode, single turn)\n"
+      : "[mode] full agent mode\n",
+  );
   if (DEBUG_MODE) {
     output.write("[debug] mode enabled\n");
   }
