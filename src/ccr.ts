@@ -10,24 +10,61 @@ const CCR_ENV_KEYS = [
   "API_TIMEOUT_MS",
 ] as const;
 
-function extractEnvValue(envDump: string, key: string): string | undefined {
-  const line = envDump
-    .split("\n")
-    .find((entry) => entry.startsWith(`${key}=`));
+function unwrapQuotedValue(rawValue: string): string {
+  const value = rawValue.trim();
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
 
-  if (!line) {
-    return undefined;
+function extractEnvValue(activateOutput: string, key: string): string | undefined {
+  for (const rawLine of activateOutput.split("\n")) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+
+    const exportPrefix = `export ${key}=`;
+    if (line.startsWith(exportPrefix)) {
+      return unwrapQuotedValue(line.slice(exportPrefix.length));
+    }
+
+    const fishPrefix = `set -gx ${key} `;
+    if (line.startsWith(fishPrefix)) {
+      return unwrapQuotedValue(line.slice(fishPrefix.length));
+    }
+
+    const kvPrefix = `${key}=`;
+    if (line.startsWith(kvPrefix)) {
+      return unwrapQuotedValue(line.slice(kvPrefix.length));
+    }
+
+    const cmdSetPrefix = `set ${key}=`;
+    if (line.toLowerCase().startsWith(cmdSetPrefix.toLowerCase())) {
+      return unwrapQuotedValue(line.slice(cmdSetPrefix.length));
+    }
+
+    const psPrefix = `$env:${key}`;
+    if (line.toLowerCase().startsWith(psPrefix.toLowerCase())) {
+      const idx = line.indexOf("=");
+      if (idx >= 0) {
+        return unwrapQuotedValue(line.slice(idx + 1));
+      }
+    }
   }
 
-  const value = line.slice(key.length + 1);
-  return value.length > 0 ? value : undefined;
+  return undefined;
 }
 
 export function setupCcrEnvironment(): void {
-  let envDump: string;
+  let activateOutput: string;
 
   try {
-    envDump = execSync('zsh -lc \'eval "$(ccr activate)"; env\'', {
+    activateOutput = execSync("ccr activate", {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -40,7 +77,7 @@ export function setupCcrEnvironment(): void {
   }
 
   for (const key of CCR_ENV_KEYS) {
-    const value = extractEnvValue(envDump, key);
+    const value = extractEnvValue(activateOutput, key);
     if (value) {
       process.env[key] = value;
     }
